@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>NYC Taxi Simulation - Model-driven</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<!-- Heatmap plugin -->
+<script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+</head>
+<body style="margin:0">
+<div id="map" style="width:100%; height:100vh;"></div>
+<script>
+const NYC_CENTER = [40.7580, -73.9855];
+const N_TAXIS = 5;
+const TRAIL_LENGTH = 10;
+const OSRM = "https://router.project-osrm.org";
+const BACKEND = "http://127.0.0.1:5000";  // Flask server
+
+// ------------- Map -------------
+const map = L.map('map').setView(NYC_CENTER, 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19}).addTo(map);
+
+// ------------- Helpers -------------
+// Linear interpolation fallback
+function interpolatePoints(start,end,steps){
+  let points=[];
+  for(let i=1;i<=steps;i++){
+    let t=i/steps;
+    points.push([start[0]+(end[0]-start[0])*t, start[1]+(end[1]-start[1])*t]);
+  }
+  return points;
+}
+
+// Snap to nearest road (for drop-offs)
+async function snapToRoad(latlng){
+  try{
+    const url = `${OSRM}/nearest/v1/driving/${latlng[1]},${latlng[0]}?number=1`;
+    const r = await fetch(url);
+    const data = await r.json();
+    const loc = data.waypoints[0].location; // [lon, lat]
+    return [loc[1], loc[0]];
+  }catch(e){
+    console.warn("nearest failed, fallback to raw point", e);
+    return latlng;
+  }
+}
+
+// Fetch route from OSRM
+async function getOSRMRoute(start, end) {
+  const url = `${OSRM}/route/v1/driving/${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson`;
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    if (data.code !== "Ok" || !data.routes || !data.routes.length){
+      throw new Error("OSRM no route");
+    }
+    const coords = data.routes[0].geometry.coordinates;
+    return coords.map(c => [c[1], c[0]]);
+  } catch (e) {
+    console.error("OSRM routing failed, fallback to straight line:", e);
+    return interpolatePoints(start, end, 50);
+  }
+}
+
+// ------------- Taxi Class -------------
+class Taxi {
+  constructor(start){
+    this.pos = start.slice();
+    this.route = [];
+    this.trail = [start.slice()];
+    this.marker = L.circleMarker(start,{radius:6,color:'red',fill:true,fillOpacity:1}).addTo(map);
+    this.polyline = L.polyline([start],{color:'red',weight:3,opacity:0.6}).addTo(map);
+    this.state = "idle"; // idle -> to_demand -> to_drop
+    this.assignedIdx = -1; // index into demands array
+  }
+  setRoute(route, nextState){
+    this.route = route.slice();
+    if (nextState) this.state = nextState;
+  }
+  step(){
+    if(this.route.length>0){
+      this.pos = this.route.shift();
+      this.trail.push(this.pos.slice());
+      if(this.trail.length>TRAIL_LENGTH) this.trail.shift();
+      this.marker.setLatLng(this.pos);
+      this.polyline.setLatLngs(this.trail);
+    }
+  }
+}
+
+// ------------- State -------------
+let taxis = [];
+for(let i=0;i<N_TAXIS;i++) taxis.push(new Taxi(NYC_CENTER.slice()));
+
+let demands = [];         // [{lat,lng,intensity, marker}]
+let demandMarkers = [];
+let dropMarkers = [];
+let heatLayer = null;
+
+// ------------- Demand via Backend -------------
+async function fetchPredictedDemands(day, time, top_k=6){
+  const res = await fetch(`${BACKEND}/predict`, {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({day, time, top_k})
+  });
+  const data = await res.json();
+  return data.demands || [];
+}
+
+async function createDemands(){
+  // Clear old markers/layers
+  demandMarkers.forEach(m => map.removeLayer(m));
+  demandMarkers = [];
+  if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
+
+  // You can wire actual system time -> weekday/time string
+  const now = new Date();
+  const weekday = now.toLocaleString('en-US', { weekday: 'long' }); // e.g., "Monday"
+  const hh = String(now.getHours()).padStart(2,'0');
+  const mm = String(now.getMinutes()).padStart(2,'0');
+  const timeStr = `${hh}:00`; // hour-bucket
+
+  const preds = await fetchPredictedDemands(weekday, timeStr, 6);
+  demands = preds.slice(0, 3); // keep 3 active demand spots (as per your original)
+
+  // Draw markers + heat
+  const heatData = [];
+  preds.forEach(p => {
+    heatData.push([p.lat, p.lng, Math.max(0.05, p.intensity)]); // avoid zero
+  });
+  heatLayer = L.heatLayer(heatData, {radius: 25}).addTo(map);
+
+  demands.forEach(d => {
+    const m = L.circleMarker([d.lat, d.lng], {
+      radius: 8,
+      color: 'blue',
+      fill: true,
+      fillOpacity: 0.6
+    }).bindPopup(`Predicted high demand<br>${weekday} ${timeStr}`).addTo(map);
+    demandMarkers.push(m);
+  });
+}
+
+// ------------- Assignment & Drops -------------
+async function assignTaxisToDemands(){
+  // distribute taxis to demands round-robin
+  for (let i=0;i<taxis.length;i++){
+    const taxi = taxis[i];
+    const d = demands[i % demands.length];
+    taxi.assignedIdx = i % demands.length;
+
+    const route = await getOSRMRoute(taxi.pos, [d.lat, d.lng]);
+    taxi.setRoute(route, taxi.state === "idle" ? "to_demand" : taxi.state);
+  }
+}
+
+async function assignDropOff(taxi){
+  // pick a drop near the same demand cluster but a bit away
+  const d = demands[taxi.assignedIdx] || demands[0];
+  const jitter = () => (Math.random()-0.5)*0.01; // ~1km jitter
+  let raw = [d.lat + jitter(), d.lng + jitter()];
+  let dropPoint = await snapToRoad(raw);
+
+  let marker = L.circleMarker(dropPoint,{
+    radius:7, color:'green', fill:true, fillOpacity:0.6
+  }).bindPopup("Drop-off").addTo(map);
+  dropMarkers.push(marker);
+
+  const route = await getOSRMRoute(taxi.pos, dropPoint);
+  taxi.setRoute(route, "to_drop");
+}
+
+// ------------- Animation -------------
+function animate(){
+  taxis.forEach(t=>{
+    const before = t.route.length;
+    t.step();
+
+    // reached target
+    if (before > 0 && t.route.length === 0){
+      if (t.state === "to_demand"){
+        assignDropOff(t);  // async; next frame will see its new route
+      } else if (t.state === "to_drop"){
+        // after drop, immediately re-assign to the *current* demands
+        t.state = "idle";
+        assignTaxisToDemands(); // taxis keep flowing without batch waits
+      }
+    }
+  });
+
+  requestAnimationFrame(animate);
+}
+
+// ------------- Start -------------
+(async ()=>{
+  await createDemands();
+  await assignTaxisToDemands();
+  requestAnimationFrame(animate);
+
+  // refresh predictions periodically (e.g., every 60s)
+  setInterval(async ()=>{
+    await createDemands();
+    await assignTaxisToDemands();
+  }, 60000);
+})();
+</script>
+</body>
+</html>

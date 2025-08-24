@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>NYC Taxi Simulation - Multiple Demands</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<style>
+  .time-display {
+    background: #fff;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    font-size: 14px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  }
+</style>
+</head>
+<body>
+<div id="map" style="width:100%; height:90vh;"></div>
+<script>
+const NYC_CENTER = [40.7580, -73.9855];
+const N_TAXIS = 5;   // increased to 5 taxis
+const N_DEMANDS = 3; // total of 3 high demand spots
+const TRAIL_LENGTH = 10;
+const OSRM_URL = "https://router.project-osrm.org/route/v1/driving/";
+
+/* ======== simple simulated clock (day + hour) ======== */
+const DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+let currentDayIndex = 0;   // start Monday
+let currentHour = 8;       // start 08:00
+function updateTime() {
+  currentHour++;
+  if (currentHour >= 24) {
+    currentHour = 0;
+    currentDayIndex = (currentDayIndex + 1) % DAYS.length;
+  }
+  if (timeControl && typeof timeControl.update === "function") timeControl.update();
+}
+/* ===================================================== */
+
+// (kept) random point generator in NYC bounding box (no longer used for markers)
+function randomPoint() {
+  return [40.60 + Math.random()*0.25, -74.05 + Math.random()*0.25];
+}
+
+// NEW: random point snapped to nearest road using OSRM Nearest (Manhattan bounds)
+async function randomRoadPoint() {
+  const latMin = 40.70, latMax = 40.82;    // Manhattan-ish bounds
+  const lngMin = -74.02, lngMax = -73.93;
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const lat = latMin + Math.random() * (latMax - latMin);
+    const lng = lngMin + Math.random() * (lngMax - lngMin);
+    const url = `https://router.project-osrm.org/nearest/v1/driving/${lng},${lat}?number=1`;
+    try {
+      const resp = await fetch(url);
+      const data = await resp.json();
+      if (data && data.code === "Ok" && data.waypoints && data.waypoints.length > 0) {
+        const [snapLng, snapLat] = data.waypoints[0].location;
+        return [snapLat, snapLng]; // [lat, lng]
+      }
+    } catch (e) {
+      console.error("OSRM nearest failed:", e);
+    }
+  }
+  // fallback: safe default if snapping fails repeatedly
+  return NYC_CENTER.slice();
+}
+
+// Linear interpolation fallback (kept)
+function interpolatePoints(start,end,steps){
+  let points=[];
+  for(let i=1;i<=steps;i++){
+    let t=i/steps;
+    points.push([start[0]+(end[0]-start[0])*t, start[1]+(end[1]-start[1])*t]);
+  }
+  return points;
+}
+
+// Fetch route from OSRM (kept)
+async function getOSRMRoute(start, end) {
+  const url = `${OSRM_URL}${start[1]},${start[0]};${end[1]},${end[0]}?overview=full&geometries=geojson`;
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    const coords = data.routes[0].geometry.coordinates;
+    return coords.map(c => [c[1], c[0]]);
+  } catch (e) {
+    console.error("OSRM routing failed, fallback to straight line:", e);
+    return interpolatePoints(start, end, 50);
+  }
+}
+
+// Taxi class (kept)
+class Taxi {
+  constructor(start){
+    this.pos=start.slice();
+    this.target=null;
+    this.drop=null;
+    this.route=[];
+    this.trail=[start.slice()];
+    this.marker=L.circleMarker(start,{radius:6,color:'red',fill:true,fillOpacity:1}).addTo(map);
+    this.polyline=L.polyline([start],{color:'red',weight:3,opacity:0.6}).addTo(map);
+    this.state="idle";
+  }
+  setRoute(route){
+    this.route=route.slice();
+    if(this.state==="idle") this.state="to_demand";
+  }
+  moveStep(){
+    if(this.route.length>0){
+      this.pos=this.route.shift();
+      this.trail.push(this.pos.slice());
+      if(this.trail.length>TRAIL_LENGTH) this.trail.shift();
+      this.marker.setLatLng(this.pos);
+      this.polyline.setLatLngs(this.trail);
+    }
+  }
+}
+
+// Initialize map (kept)
+const map=L.map('map').setView(NYC_CENTER,12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+
+/* ======== always-visible day/time overlay (kept) ======== */
+const timeControl = L.control({position:'topright'});
+timeControl.onAdd = function() {
+  this._div = L.DomUtil.create('div', 'time-display');
+  this.update();
+  return this._div;
+};
+timeControl.update = function() {
+  const hh = String(currentHour).padStart(2,'0');
+  this._div.innerHTML = `<b>${DAYS[currentDayIndex]}</b><br>${hh}:00`;
+};
+timeControl.addTo(map);
+/* ======================================================== */
+
+// Initialize taxis (kept)
+let taxis=[];
+for(let i=0;i<N_TAXIS;i++) taxis.push(new Taxi(NYC_CENTER.slice()));
+
+// Current demands (kept)
+let demands=[];
+let demandMarkers=[];
+
+// Create N_DEMANDS demand spots (MODIFIED to use randomRoadPoint)
+async function createDemands(){
+  // advance simulated time each cycle
+  updateTime();
+
+  demands=[];
+  demandMarkers.forEach(m=>map.removeLayer(m));
+  demandMarkers=[];
+
+  for(let i=0;i<N_DEMANDS;i++){
+    const d = await randomRoadPoint();   // << strictly on roads
+    demands.push(d);
+
+    const hh = String(currentHour).padStart(2,'0');
+    const popupText = `High Demand<br>${DAYS[currentDayIndex]}, ${hh}:00`;
+
+    let m=L.circleMarker(d,{radius:8,color:'blue',fill:true,fillOpacity:0.6})
+           .bindPopup(popupText)
+           .addTo(map);
+    demandMarkers.push(m);
+  }
+}
+
+// Individual drop-offs (MODIFIED to use randomRoadPoint)
+let drops = [];
+async function assignDropOff(taxi){
+  const dropPoint = await randomRoadPoint(); // << strictly on roads
+  let marker = L.circleMarker(dropPoint,{
+    radius:7,
+    color:'green',
+    fill:true,
+    fillOpacity:0.6
+  }).bindPopup("Drop-off").addTo(map);
+
+  drops.push({taxi: taxi, point: dropPoint, marker: marker});
+  taxi.state = "to_drop";
+  const route = await getOSRMRoute(taxi.pos, dropPoint);
+  taxi.setRoute(route);
+}
+
+// Assign taxis to demands in a distributed way (kept)
+async function assignTaxisToDemands(){
+  let shuffled = taxis.slice().sort(() => Math.random() - 0.5);
+  for (let i=0; i<shuffled.length; i++) {
+    let demand = demands[i % demands.length];
+    shuffled[i].target = demand.slice();
+    const route = await getOSRMRoute(shuffled[i].pos, shuffled[i].target);
+    shuffled[i].setRoute(route);
+  }
+}
+
+// Main animation (kept; only wrapped async calls in an IIFE)
+function animate(){
+  taxis.forEach(t=>{
+    t.moveStep();
+
+    // If taxi reaches demand and has no drop assigned yet
+    if(t.state === "to_demand" && t.route.length === 0 && !drops.some(d=>d.taxi===t)){
+      assignDropOff(t); // async, fire-and-forget is fine here
+    }
+  });
+
+  // When all taxis finish their drop-offs, spawn new demands & reassign
+  if(drops.length === N_TAXIS && drops.every(d=>d.taxi.route.length===0)){
+    demandMarkers.forEach(m=>map.removeLayer(m));
+    drops.forEach(d=>map.removeLayer(d.marker));
+    drops = [];
+
+    (async () => {
+      await createDemands();           // new demands strictly on roads
+      await assignTaxisToDemands();    // route taxis to those demands
+    })();
+  }
+
+  requestAnimationFrame(animate);
+}
+
+// Start simulation (ensure demand creation finishes before assigning)
+(async function init(){
+  await createDemands();        // strictly on roads
+  await assignTaxisToDemands(); // route taxis
+  requestAnimationFrame(animate);
+})();
+</script>
+</body>
+</html>
