@@ -1,1 +1,1 @@
-web: python Backend_2.py 
+"web: gunicorn Backend_2:app" 
