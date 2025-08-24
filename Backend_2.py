@@ -3,14 +3,18 @@ from flask import Flask, jsonify
 import pickle
 import random
 from datetime import datetime
+import os
 
 app = Flask(__name__)
 
-# Load trained model + encoders
-model = pickle.load(open("C:\Pragun\Project\Final project\Simulation part\Last try\Trained models\landmark_demand_predictor.pkl", "rb"))
-le_day = pickle.load(open("C:\Pragun\Project\Final project\Simulation part\Last try\Trained models\label_encoder_day.pkl", "rb"))
-le_time = pickle.load(open("C:\Pragun\Project\Final project\Simulation part\Last try\Trained models\label_encoder_time.pkl", "rb"))
-le_type = pickle.load(open("C:\Pragun\Project\Final project\Simulation part\Last try\Trained models\label_encoder_type.pkl", "rb"))
+# Base path (current file's directory)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Load trained model + encoders using relative paths
+model = pickle.load(open(os.path.join(BASE_DIR, "Trained models", "landmark_demand_predictor.pkl"), "rb"))
+le_day = pickle.load(open(os.path.join(BASE_DIR, "Trained models", "label_encoder_day.pkl"), "rb"))
+le_time = pickle.load(open(os.path.join(BASE_DIR, "Trained models", "label_encoder_time.pkl"), "rb"))
+le_type = pickle.load(open(os.path.join(BASE_DIR, "Trained models", "label_encoder_type.pkl"), "rb"))
 
 # Simulation clock
 current_day_index = 0  # 0=Monday
