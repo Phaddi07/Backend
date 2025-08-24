@@ -2,7 +2,6 @@
 from flask import Flask, jsonify
 import pickle
 import random
-from datetime import datetime
 import os
 
 app = Flask(__name__)
@@ -20,6 +19,11 @@ le_type = pickle.load(open(os.path.join(BASE_DIR, "Trained models", "label_encod
 current_day_index = 0  # 0=Monday
 current_time_index = 0  # each tick = 15 mins, 0 = 00:00
 days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+# Root route (for Render health check / base test)
+@app.route("/")
+def home():
+    return jsonify({"message": "Taxi Swarm Backend is running!"})
 
 @app.route("/next_demand")
 def next_demand():
@@ -59,4 +63,4 @@ def next_demand():
     })
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
